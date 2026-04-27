@@ -137,6 +137,12 @@ fn dispatch(
                     }
                 };
 
+                if let Err(e) = db.bump_timestamp(id) {
+                    return Response::Error {
+                        message: e.to_string(),
+                    };
+                }
+
                 (hash, payloads)
             };
 

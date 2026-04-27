@@ -79,8 +79,17 @@ impl Database {
         // If hash already exists, bump timestamp and return existing id.
         if let Some(id) = self.find_by_hash(hash)? {
             self.conn.execute(
-                "UPDATE entries SET timestamp = ?1 WHERE id = ?2",
-                params![timestamp.to_rfc3339(), id],
+                "UPDATE entries
+                 SET kind = ?1, label = ?2, preview = ?3, size = ?4, timestamp = ?5
+                 WHERE id = ?6",
+                params![
+                    kind.label(),
+                    label,
+                    preview,
+                    size as i64,
+                    timestamp.to_rfc3339(),
+                    id
+                ],
             )?;
             return Ok(id);
         }
@@ -209,6 +218,14 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn bump_timestamp(&self, entry_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET timestamp = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), entry_id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete(&self, entry_id: i64) -> Result<bool> {
         let n = self
             .conn
@@ -321,6 +338,8 @@ mod tests {
             assert_eq!(entries[0].id, first_id, "{}", kind.label());
             assert_eq!(entries[0].hash, hash, "{}", kind.label());
             assert_eq!(entries[0].kind, kind, "{}", kind.label());
+            assert_eq!(entries[0].label, "second label", "{}", kind.label());
+            assert_eq!(entries[0].preview, "second preview", "{}", kind.label());
             assert_eq!(entries[0].timestamp, second_ts, "{}", kind.label());
 
             std::fs::remove_file(&db_path).ok();

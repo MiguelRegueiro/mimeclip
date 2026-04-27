@@ -4,7 +4,7 @@
 /// compute a hash over the full set of (mime, content) pairs, and store the entry.
 /// This means "copy file" and "copy file path as text" produce distinct hashes
 /// because their MIME type sets differ even if the text/plain content is identical.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -201,6 +201,56 @@ fn should_skip(mime: &str) -> bool {
         .any(|prefix| mime.starts_with(prefix))
 }
 
+fn normalize_payloads(payloads: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    let mut grouped: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+
+    for (mime, data) in payloads {
+        grouped.entry(mime).or_default().push(data);
+    }
+
+    let mut normalized = Vec::with_capacity(grouped.len());
+
+    for (mime, variants) in grouped {
+        let original_count = variants.len();
+        let mut unique_variants: Vec<Vec<u8>> = Vec::new();
+
+        for data in variants {
+            if !unique_variants.iter().any(|existing| existing == &data) {
+                unique_variants.push(data);
+            }
+        }
+
+        if original_count > 1 && unique_variants.len() == 1 {
+            debug!("deduplicated {original_count} identical payloads for MIME type {mime}");
+        } else if unique_variants.len() > 1 {
+            warn!(
+                "multiple payload variants for MIME type {mime}; keeping lexicographically smallest variant out of {}",
+                unique_variants.len()
+            );
+        }
+
+        unique_variants.sort();
+        normalized.push((mime, unique_variants.remove(0)));
+    }
+
+    normalized
+}
+
+fn payload_hash(payloads: &[(String, Vec<u8>)]) -> String {
+    let mut sorted = payloads.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut hasher = Sha256::new();
+    for (mime, data) in &sorted {
+        hasher.update(mime.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(data);
+        hasher.update(b"\x00");
+    }
+
+    hex::encode(hasher.finalize())
+}
+
 /// Process a ready offer: issue receive() for each MIME type, flush, read, store.
 /// Must be called from the main loop (not from within dispatch) so we can flush.
 fn process_ready(
@@ -253,7 +303,7 @@ fn process_ready(
         .collect();
 
     let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut total_size = 0usize;
+    let mut raw_total_size = 0usize;
 
     for (mime, read_fd) in pipes {
         let mut f = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
@@ -265,8 +315,8 @@ fn process_ready(
                 continue;
             }
         }
-        total_size += buf.len();
-        if total_size > MAX_PAYLOAD_BYTES {
+        raw_total_size += buf.len();
+        if raw_total_size > MAX_PAYLOAD_BYTES {
             warn!("entry exceeds 64 MiB cap, skipping");
             offer.destroy();
             return;
@@ -282,19 +332,15 @@ fn process_ready(
         return;
     }
 
-    // Hash over sorted (mime, data) pairs — the key insight is that
+    let payloads = normalize_payloads(payloads);
+    let total_size: usize = payloads.iter().map(|(_, data)| data.len()).sum();
+    let mime_types: Vec<String> = payloads.iter().map(|(mime, _)| mime.clone()).collect();
+
+    // Hash over the normalized (mime, data) pairs — the key insight is that
     // (text/plain + x-special/gnome-copied-files + text/uri-list) hashes
-    // differently from (text/plain) even with identical text content.
-    let mut sorted = payloads.clone();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = Sha256::new();
-    for (mime, data) in &sorted {
-        hasher.update(mime.as_bytes());
-        hasher.update(b"\x00");
-        hasher.update(data);
-        hasher.update(b"\x00");
-    }
-    let hash = hex::encode(hasher.finalize());
+    // differently from (text/plain) even with identical text content, while
+    // duplicate MIME names with identical payloads collapse to the same entry.
+    let hash = payload_hash(&payloads);
 
     if suppress_hash.lock().unwrap().should_suppress(&hash) {
         info!("suppressed restored entry {hash}");
@@ -365,5 +411,66 @@ pub fn run(db: Arc<Mutex<Database>>, suppress_hash: SharedSuppressState) -> Resu
             let suppress_hash = state.suppress_hash.clone();
             process_ready(ready, &db, &suppress_hash, &mut event_queue);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_payloads, payload_hash};
+
+    #[test]
+    fn duplicate_mime_names_hash_like_deduped_payloads() {
+        let duplicated = vec![
+            ("text/plain".to_string(), b"/tmp/example.txt".to_vec()),
+            (
+                "text/plain;charset=utf-8".to_string(),
+                b"/tmp/example.txt".to_vec(),
+            ),
+            ("text/plain".to_string(), b"/tmp/example.txt".to_vec()),
+            (
+                "text/plain;charset=utf-8".to_string(),
+                b"/tmp/example.txt".to_vec(),
+            ),
+        ];
+        let deduped = vec![
+            (
+                "text/plain;charset=utf-8".to_string(),
+                b"/tmp/example.txt".to_vec(),
+            ),
+            ("text/plain".to_string(), b"/tmp/example.txt".to_vec()),
+        ];
+
+        let normalized_duplicated = normalize_payloads(duplicated);
+        let normalized_deduped = normalize_payloads(deduped);
+
+        assert_eq!(normalized_duplicated, normalized_deduped);
+        assert_eq!(
+            payload_hash(&normalized_duplicated),
+            payload_hash(&normalized_deduped)
+        );
+    }
+
+    #[test]
+    fn duplicate_mime_names_with_different_bytes_normalize_deterministically() {
+        let first_order = vec![
+            ("text/plain".to_string(), b"beta".to_vec()),
+            ("text/plain".to_string(), b"alpha".to_vec()),
+        ];
+        let second_order = vec![
+            ("text/plain".to_string(), b"alpha".to_vec()),
+            ("text/plain".to_string(), b"beta".to_vec()),
+        ];
+
+        let normalized_first = normalize_payloads(first_order);
+        let normalized_second = normalize_payloads(second_order);
+
+        assert_eq!(normalized_first, normalized_second);
+        assert_eq!(normalized_first.len(), 1);
+        assert_eq!(normalized_first[0].0, "text/plain");
+        assert_eq!(normalized_first[0].1, b"alpha".to_vec());
+        assert_eq!(
+            payload_hash(&normalized_first),
+            payload_hash(&normalized_second)
+        );
     }
 }

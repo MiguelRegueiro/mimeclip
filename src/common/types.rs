@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use imagesize::blob_size;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -137,9 +138,29 @@ pub fn build_label(kind: &EntryKind, mime_payloads: &[(String, Vec<u8>)]) -> Str
                 "text".to_string()
             }
         }
-        EntryKind::Image => "image".to_string(),
+        EntryKind::Image => build_image_label(mime_payloads),
         EntryKind::Other => "binary".to_string(),
     }
+}
+
+fn build_image_label(mime_payloads: &[(String, Vec<u8>)]) -> String {
+    for (mime, data) in mime_payloads {
+        let format = match mime.as_str() {
+            "image/png" => Some("PNG"),
+            "image/jpeg" => Some("JPEG"),
+            "image/webp" => Some("WebP"),
+            "image/gif" => Some("GIF"),
+            _ => None,
+        };
+
+        if let Some(format) = format {
+            if let Ok(size) = blob_size(data) {
+                return format!("{format} {}x{}", size.width, size.height);
+            }
+        }
+    }
+
+    "Image".to_string()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -160,4 +181,31 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_label, EntryKind};
+    use base64::Engine;
+
+    #[test]
+    fn image_labels_include_format_and_dimensions_when_detectable() {
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2h0AAAAASUVORK5CYII=")
+            .expect("decode test png");
+
+        let label = build_label(&EntryKind::Image, &[("image/png".to_string(), png)]);
+
+        assert_eq!(label, "PNG 1x1");
+    }
+
+    #[test]
+    fn image_labels_fall_back_to_generic_name_when_size_is_not_detectable() {
+        let label = build_label(
+            &EntryKind::Image,
+            &[("image/png".to_string(), b"not-a-real-png".to_vec())],
+        );
+
+        assert_eq!(label, "Image");
+    }
 }

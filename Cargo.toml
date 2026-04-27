@@ -35,3 +35,4 @@ nix = { version = "0.29", features = ["signal", "process", "fs"] }
 libc = "0.2"
 base64 = "0.22"
 signal-hook = "0.3"
+imagesize = { version = "0.14", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
