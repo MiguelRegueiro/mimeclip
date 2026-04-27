@@ -14,7 +14,7 @@ mimeclip stores **every MIME type offered** per clipboard event and restores the
 ## Build
 
 ```bash
-git clone <repo>
+git clone https://github.com/MiguelRegueiro/mimeclip
 cd mimeclip
 cargo build --release
 ```
