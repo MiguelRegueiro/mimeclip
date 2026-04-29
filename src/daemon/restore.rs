@@ -4,10 +4,11 @@
 /// until the source is cancelled (something pasted or clipboard was replaced).
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use log::{debug, warn};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use wayland_client::{
     protocol::{wl_registry, wl_seat::WlSeat},
     Connection, Dispatch, EventQueue, QueueHandle,
@@ -148,8 +149,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for RestoreState {
                 debug!("send request for {mime_type}");
                 let fd: OwnedFd = fd;
                 if let Some(data) = state.payloads.get(&mime_type) {
-                    let mut f = std::fs::File::from(fd);
-                    if let Err(e) = f.write_all(data) {
+                    if let Err(e) = write_all_to_fd(fd, data) {
                         warn!("write to fd for {mime_type}: {e}");
                     }
                 } else {
@@ -164,6 +164,26 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for RestoreState {
             _ => {}
         }
     }
+}
+
+fn write_all_to_fd(fd: OwnedFd, data: &[u8]) -> Result<()> {
+    set_fd_blocking(&fd)?;
+
+    let mut f = std::fs::File::from(fd);
+    f.write_all(data)?;
+    f.flush()?;
+    Ok(())
+}
+
+fn set_fd_blocking(fd: &OwnedFd) -> Result<()> {
+    let raw_fd = fd.as_raw_fd();
+    let flags = OFlag::from_bits_retain(fcntl(raw_fd, FcntlArg::F_GETFL)?);
+
+    if flags.contains(OFlag::O_NONBLOCK) {
+        fcntl(raw_fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK))?;
+    }
+
+    Ok(())
 }
 
 pub fn restore_entry(payloads: Vec<(String, Vec<u8>)>) -> Result<()> {
@@ -205,4 +225,36 @@ pub fn restore_entry(payloads: Vec<(String, Vec<u8>)>) -> Result<()> {
     device.destroy();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_all_to_fd;
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::unistd::pipe;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::thread;
+
+    #[test]
+    fn write_all_to_fd_handles_nonblocking_wayland_pipes() {
+        let (read_fd, write_fd) = pipe().expect("pipe");
+        let read_handle = thread::spawn(move || {
+            let mut reader = std::fs::File::from(read_fd);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).expect("read all");
+            out
+        });
+
+        let raw_fd = write_fd.as_raw_fd();
+        let flags = OFlag::from_bits_retain(fcntl(raw_fd, FcntlArg::F_GETFL).expect("get flags"));
+        fcntl(raw_fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).expect("set nonblocking");
+
+        let data = vec![0x5a; 256 * 1024];
+        write_all_to_fd(write_fd, &data).expect("write all");
+
+        let received = read_handle.join().expect("reader thread");
+        assert_eq!(received.len(), data.len());
+        assert_eq!(received, data);
+    }
 }
