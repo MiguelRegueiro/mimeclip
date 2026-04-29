@@ -1,7 +1,6 @@
 [Unit]
 Description=mimeclip clipboard history daemon
 After=graphical-session.target
-PartOf=graphical-session.target
 
 [Service]
 ExecStart=%h/.cargo/bin/mimeclipd

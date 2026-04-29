@@ -84,10 +84,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn send_request(req: Request) -> Result<Response> {
+fn connect_with_retry() -> Result<UnixStream> {
     let path = socket_path();
-    let stream = UnixStream::connect(&path)
-        .with_context(|| format!("cannot connect to mimeclipd at {}", path.display()))?;
+    const RETRIES: u32 = 5;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+    for attempt in 0..=RETRIES {
+        match UnixStream::connect(&path) {
+            Ok(stream) => return Ok(stream),
+            Err(e)
+                if attempt < RETRIES
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+            {
+                std::thread::sleep(DELAY);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("cannot connect to mimeclipd at {}", path.display())));
+            }
+        }
+    }
+    unreachable!()
+}
+
+fn send_request(req: Request) -> Result<Response> {
+    let stream = connect_with_retry()?;
 
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
