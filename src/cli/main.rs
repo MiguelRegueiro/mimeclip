@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List clipboard history (newest first)
+    /// List clipboard history (most recently used first)
     List {
         #[arg(short, long, default_value = "50")]
         limit: usize,
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
                     "{id:>6}  {kind:<5}  {ts}  {label}",
                     id = e.id,
                     kind = e.kind.label(),
-                    ts = e.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                    ts = e.created_at.format("%Y-%m-%d %H:%M:%S"),
                     label = e.label,
                 );
             }

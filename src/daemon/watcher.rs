@@ -358,7 +358,7 @@ fn process_ready(
         label: &label,
         preview: &preview,
         size: total_size,
-        timestamp: now,
+        created_at: now,
         payloads: &payloads,
     }) {
         Ok(id) => info!(

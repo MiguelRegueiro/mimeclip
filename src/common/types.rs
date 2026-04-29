@@ -38,7 +38,8 @@ pub struct Entry {
     pub label: String,
     pub preview: String,
     pub size: usize,
-    pub timestamp: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: DateTime<Utc>,
     pub mime_types: Vec<String>,
 }
 

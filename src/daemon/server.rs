@@ -137,7 +137,7 @@ fn dispatch(
                     }
                 };
 
-                if let Err(e) = db.bump_timestamp(id) {
+                if let Err(e) = db.touch_last_used(id) {
                     return Response::Error {
                         message: e.to_string(),
                     };
