@@ -34,6 +34,9 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const SKIP_MIME_PREFIXES: &[&str] = &[
     "application/vnd.portal.filetransfer",
     "application/vnd.portal.files",
+    // Gecko-internal clipboard round-tripping format. Requesting it over
+    // Wayland data control can crash Firefox/Zen when copying from Google Docs.
+    "application/x-moz-custom-clipdata",
 ];
 
 struct PendingOffer {
