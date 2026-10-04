@@ -266,6 +266,23 @@ impl Database {
 
     pub fn clear(&self) -> Result<usize> {
         let n = self.conn.execute("DELETE FROM entries", [])?;
+
+        // Clearing history is an explicit maintenance action, so reclaim all
+        // deleted image/blob pages here rather than carrying that space forward
+        // indefinitely. Normal inserts, deletes, and clipboard restores never
+        // pay this cost.
+        // VACUUM while remaining in WAL mode can compact the logical database
+        // without truncating its main file on some filesystems. Switch to the
+        // rollback journal for this one explicit maintenance operation, then
+        // restore WAL for normal clipboard traffic.
+        self.conn
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;
+                 VACUUM;
+                 PRAGMA journal_mode=WAL;",
+            )
+            .context("compacting cleared clipboard history database")?;
         Ok(n)
     }
 
@@ -545,6 +562,45 @@ mod tests {
         assert_eq!(entries[0].last_used_at, created_at);
 
         std::fs::remove_file(&db_path).ok();
+    }
+
+    #[test]
+    fn clear_reclaims_payload_pages() {
+        let db_path = unique_test_db_path("clear-vacuum");
+        let db = Database::open(&db_path).expect("open test database");
+        let payload = vec![0xAB; 1024 * 1024];
+
+        db.insert(NewEntry {
+            hash: "clear-vacuum-hash",
+            kind: &EntryKind::Image,
+            label: "image",
+            preview: "image",
+            size: payload.len(),
+            created_at: Utc::now(),
+            payloads: &[("image/png".to_string(), payload)],
+        })
+        .expect("insert payload");
+
+        assert_eq!(db.clear().expect("clear database"), 1);
+        assert!(db.list(1).expect("list cleared database").is_empty());
+
+        let freelist_pages: i64 = db
+            .conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .expect("read freelist count");
+        assert_eq!(freelist_pages, 0);
+
+        let db_size = std::fs::metadata(&db_path)
+            .expect("read compacted database metadata")
+            .len();
+        assert!(
+            db_size < 64 * 1024,
+            "compacted empty database should be small, got {db_size} bytes"
+        );
+
+        std::fs::remove_file(&db_path).ok();
+        std::fs::remove_file(db_path.with_extension("sqlite3-wal")).ok();
+        std::fs::remove_file(db_path.with_extension("sqlite3-shm")).ok();
     }
 
     fn unique_test_db_path(label: &str) -> PathBuf {

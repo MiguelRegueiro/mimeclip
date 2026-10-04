@@ -43,30 +43,25 @@ Binaries land in `target/release/`:
 - `mimeclipd` — the daemon
 - `mimeclip` — the CLI client
 
-## Install
+## Install or update
 
-Install to `~/.cargo/bin` (recommended — matches the path the service file expects):
-
-```bash
-cargo install --path . --locked
-```
-
-Or copy binaries manually to somewhere on your `$PATH`:
+From a checkout, run one command:
 
 ```bash
-cargo build --release
-sudo cp target/release/mimeclipd target/release/mimeclip /usr/local/bin/
+./scripts/install.sh
 ```
+
+It installs both binaries with Cargo to `~/.cargo/bin`, installs/updates the
+current user's `mimeclipd` systemd service, starts it, and verifies it responds.
+It uses neither `sudo` nor a distribution package manager, so the same command
+works on Arch and Fedora. It requires a Rust toolchain and a systemd user
+session.
 
 ## Running as a systemd user service
 
-A service file is included at `systemd/mimeclipd.service`. It assumes the binary is at `~/.cargo/bin/mimeclipd` (the default for `cargo install`). Edit `ExecStart` if you installed elsewhere.
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/mimeclipd.service ~/.config/systemd/user/
-systemctl --user enable --now mimeclipd
-```
+`scripts/install.sh` handles this automatically. The installed service is at
+`~/.config/systemd/user/mimeclipd.service` and runs
+`~/.cargo/bin/mimeclipd`.
 
 Check it started:
 
@@ -81,7 +76,7 @@ mimeclip list [--limit N] [--json]   list history, newest first
 mimeclip restore <id>                restore entry to clipboard (all MIME types)
 mimeclip delete <id>                 remove an entry
 mimeclip decode <id>                 dump all MIME payloads as base64 JSON
-mimeclip clear                       wipe all history
+mimeclip clear                       wipe all history and compact its database
 mimeclip ping                        check daemon is alive
 ```
 
@@ -188,6 +183,11 @@ To wipe all history:
 ```bash
 mimeclip clear
 ```
+
+Clearing checkpoints the WAL and vacuums the SQLite database, reclaiming space
+from deleted image and blob payloads. This runs only for an explicit full clear,
+not during ordinary clipboard operations. It is not a secure erase: storage
+media, filesystem snapshots, or SSD wear-leveling may retain old bytes.
 
 To stop recording temporarily:
 
