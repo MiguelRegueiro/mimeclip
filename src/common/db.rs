@@ -3,13 +3,13 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
+use crate::common::config::{Config, Limits};
 use crate::common::types::{Entry, EntryKind, MimePayload};
-
-const DEFAULT_MAX_ENTRIES: usize = 500;
 
 pub struct Database {
     conn: Connection,
     max_entries: usize,
+    max_history_size: u64,
     has_legacy_timestamp: bool,
 }
 
@@ -29,19 +29,28 @@ impl Database {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database at {}", path.display()))?;
         restrict_database_permissions(path)?;
-        let max_entries = std::env::var("MIMECLIP_MAX_ENTRIES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MAX_ENTRIES);
+        let limits = Config::load()?.limits()?;
         let mut db = Self {
             conn,
-            max_entries,
+            max_entries: limits.max_entries,
+            max_history_size: limits.max_history_size,
             has_legacy_timestamp: false,
         };
         db.init()?;
         restrict_database_permissions(path)?;
         db.has_legacy_timestamp = db.entries_column_exists("timestamp")?;
         Ok(db)
+    }
+
+    pub fn reload_config(&mut self) -> Result<()> {
+        let limits = Config::load()?.limits()?;
+        self.set_limits(limits)
+    }
+
+    fn set_limits(&mut self, limits: Limits) -> Result<()> {
+        self.max_entries = limits.max_entries;
+        self.max_history_size = limits.max_history_size;
+        self.trim()
     }
 
     fn init(&self) -> Result<()> {
@@ -99,6 +108,7 @@ impl Database {
                  WHERE id = ?6",
                 params![kind.label(), label, preview, size as i64, &created_at, id],
             )?;
+            self.trim()?;
             return Ok(id);
         }
 
@@ -154,6 +164,28 @@ impl Database {
             )",
             params![self.max_entries as i64],
         )?;
+        let total: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
+                    row.get(0)
+                })?;
+        if total > self.max_history_size as i64 {
+            let mut remaining = total;
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, size FROM entries ORDER BY last_used_at ASC, id ASC")?;
+            let entries = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (id, size) in entries {
+                if remaining <= self.max_history_size as i64 {
+                    break;
+                }
+                self.conn
+                    .execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+                remaining -= size;
+            }
+        }
         Ok(())
     }
 
@@ -400,7 +432,7 @@ fn parse_kind(s: &str) -> EntryKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, NewEntry};
+    use super::{Database, Limits, NewEntry};
     use crate::common::types::EntryKind;
     use chrono::{Duration, TimeZone, Utc};
     use rusqlite::{params, Connection};
@@ -627,6 +659,47 @@ mod tests {
         std::fs::remove_file(&db_path).ok();
         std::fs::remove_file(db_path.with_extension("sqlite3-wal")).ok();
         std::fs::remove_file(db_path.with_extension("sqlite3-shm")).ok();
+    }
+
+    #[test]
+    fn total_history_limit_evicts_least_recently_used_entries() {
+        let db_path = unique_test_db_path("total-size-limit");
+        let mut db = Database::open(&db_path).expect("open test database");
+        db.set_limits(Limits {
+            max_entries: 10,
+            max_history_size: 10,
+        })
+        .expect("set limits");
+
+        for (hash, timestamp) in [
+            (
+                "oldest",
+                Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap(),
+            ),
+            (
+                "newest",
+                Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap(),
+            ),
+        ] {
+            db.insert(NewEntry {
+                hash,
+                kind: &EntryKind::Text,
+                label: hash,
+                preview: hash,
+                size: 6,
+                created_at: timestamp,
+                payloads: &[("text/plain".to_string(), vec![0; 6])],
+            })
+            .expect("insert entry");
+        }
+
+        let entries = db.list(10).expect("list trimmed entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, "newest");
+
+        std::fs::remove_file(&db_path).ok();
+        std::fs::remove_file(format!("{}-wal", db_path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", db_path.display())).ok();
     }
 
     #[cfg(unix)]

@@ -11,6 +11,7 @@ pub enum Request {
     Delete { id: i64 },
     Restore { id: i64 },
     OfferScreenshot { path: String },
+    ReloadConfig,
     Clear,
     Ping,
 }

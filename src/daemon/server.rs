@@ -135,6 +135,13 @@ fn dispatch(
     match req {
         Request::Ping => Response::Pong,
 
+        Request::ReloadConfig => match db.lock().unwrap().reload_config() {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error {
+                message: e.to_string(),
+            },
+        },
+
         Request::List { limit } => {
             let limit = limit.unwrap_or(200);
             match db.lock().unwrap().list(limit) {

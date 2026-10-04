@@ -155,14 +155,41 @@ In common `wl-paste --watch cliphist store` setups, the history backend receives
 
 ## Configuration
 
-No config file. Behavior is controlled by environment variables:
+Run this in a terminal for a small interactive setup:
+
+```bash
+mimeclip config
+```
+
+It persists settings in `$XDG_CONFIG_HOME/mimeclip/config.toml` (normally
+`~/.config/mimeclip/config.toml`) and applies them to the running daemon
+immediately. The default limits are **256 MiB total payload data** and **500
+entries**. The daemon checks limits only after storing a new clipboard entry;
+there is no timer or background maintenance process. When a limit is exceeded,
+the least recently used entries are removed. SQLite reuses that space normally;
+only `mimeclip clear` performs the heavier physical compaction.
+
+For viewing or scripting:
+
+```bash
+mimeclip config show
+mimeclip config set max-history-size 512MiB
+mimeclip config set max-entries 750
+```
+
+The total-size limit counts stored clipboard payload bytes, rather than the
+SQLite file size (which can temporarily include reusable pages and WAL data).
+
+Environment variables remain available for service setups and override the
+saved file:
 
 | Variable | Default | Effect |
 |---|---|---|
 | `RUST_LOG` | `info` | Log level (`error`, `warn`, `info`, `debug`) |
 | `XDG_RUNTIME_DIR` | `/tmp` | Socket location |
 | `XDG_DATA_HOME` | `~/.local/share` | Database location |
-| `MIMECLIP_MAX_ENTRIES` | `500` | Maximum entries kept; oldest are pruned automatically |
+| `MIMECLIP_MAX_ENTRIES` | saved setting | Maximum entries kept; least recently used entries are pruned automatically |
+| `MIMECLIP_MAX_HISTORY_SIZE` | saved setting | Total stored payload limit, e.g. `256MiB` |
 
 ## Privacy and security
 
@@ -172,7 +199,7 @@ mimeclip records clipboard history locally. Be aware of the following:
 - **Storage is not encrypted.** The SQLite database at `~/.local/share/mimeclip/history.db` remains plaintext to your own account and to any process that can act as it. Use full-disk encryption to protect a powered-off machine or its backups.
 - **Password-manager hints are honored.** A clipboard selection offering the KDE-standard `x-kde-passwordManagerHint` MIME type is treated as sensitive and discarded before mimeclip requests or stores any payload. KeePassXC and other password managers commonly use this hint.
 - **Unmarked secrets are still captured.** No clipboard manager can safely infer that arbitrary text is a password. If an application does not mark its clipboard data sensitive, pause mimeclip before copying the secret or clear/delete it afterward.
-- **History is persistent across reboots.** Entries remain until explicitly deleted or until the `MIMECLIP_MAX_ENTRIES` limit is reached and they are pushed out.
+- **History is persistent across reboots.** Entries remain until explicitly deleted or until the configured count or total-size limit is reached and they are pushed out.
 
 To delete a specific entry:
 
