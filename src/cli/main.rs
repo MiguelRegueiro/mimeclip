@@ -29,6 +29,8 @@ enum Cmd {
     Delete { id: i64 },
     /// Restore an entry to the clipboard (re-offers all MIME types)
     Restore { id: i64 },
+    /// Offer a screenshot as an image, a plain filesystem path, and a file URI
+    Screenshot { path: std::path::PathBuf },
     /// Clear all history
     Clear,
     /// Check if the daemon is running
@@ -45,6 +47,9 @@ fn main() -> Result<()> {
         Cmd::Decode { id } => Request::Decode { id: *id },
         Cmd::Delete { id } => Request::Delete { id: *id },
         Cmd::Restore { id } => Request::Restore { id: *id },
+        Cmd::Screenshot { path } => Request::OfferScreenshot {
+            path: path.to_string_lossy().into_owned(),
+        },
         Cmd::Clear => Request::Clear,
         Cmd::Ping => Request::Ping,
     };

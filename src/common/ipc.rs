@@ -9,6 +9,7 @@ pub enum Request {
     Decode { id: i64 },
     Delete { id: i64 },
     Restore { id: i64 },
+    OfferScreenshot { path: String },
     Clear,
     Ping,
 }

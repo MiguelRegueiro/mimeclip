@@ -2,7 +2,6 @@
 ///
 /// We become a Wayland data source, offer all stored MIME types, and serve data
 /// until the source is cancelled (something pasted or clipboard was replaced).
-use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -23,7 +22,9 @@ use wayland_protocols_wlr::data_control::v1::client::{
 struct RestoreState {
     manager: Option<ZwlrDataControlManagerV1>,
     seat: Option<WlSeat>,
-    payloads: HashMap<String, Vec<u8>>,
+    // MIME offer order is observable by paste targets. Keep the database/source
+    // order instead of putting the payloads in a hash map, which randomizes it.
+    payloads: Vec<(String, Vec<u8>)>,
     done: bool,
 }
 
@@ -32,7 +33,7 @@ impl RestoreState {
         Self {
             manager: None,
             seat: None,
-            payloads: payloads.into_iter().collect(),
+            payloads,
             done: false,
         }
     }
@@ -148,7 +149,8 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for RestoreState {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
                 debug!("send request for {mime_type}");
                 let fd: OwnedFd = fd;
-                if let Some(data) = state.payloads.get(&mime_type) {
+                if let Some((_, data)) = state.payloads.iter().find(|(mime, _)| mime == &mime_type)
+                {
                     if let Err(e) = write_all_to_fd(fd, data) {
                         warn!("write to fd for {mime_type}: {e}");
                     }
@@ -210,7 +212,7 @@ pub fn restore_entry(payloads: Vec<(String, Vec<u8>)>) -> Result<()> {
     let device = manager.get_data_device(seat, &qh, ());
     let source = manager.create_data_source(&qh, ());
 
-    for mime in state.payloads.keys() {
+    for (mime, _) in &state.payloads {
         source.offer(mime.clone());
     }
 

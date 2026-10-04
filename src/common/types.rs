@@ -59,12 +59,12 @@ pub fn classify_kind(mime_types: &[String]) -> EntryKind {
         return EntryKind::File;
     }
 
-    if mime_types.iter().any(|m| m == "text/uri-list") {
-        return EntryKind::Uri;
-    }
-
     if has("image/") {
         return EntryKind::Image;
+    }
+
+    if mime_types.iter().any(|m| m == "text/uri-list") {
+        return EntryKind::Uri;
     }
 
     if has("text/") {
