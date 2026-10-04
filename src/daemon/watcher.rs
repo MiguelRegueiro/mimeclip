@@ -6,12 +6,15 @@
 /// because their MIME type sets differ even if the text/plain content is identical.
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
-use std::os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, info, warn};
+use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags};
 use sha2::{Digest, Sha256};
 use wayland_client::{
     protocol::{wl_registry, wl_seat::WlSeat},
@@ -29,6 +32,8 @@ use mimeclip_common::common::types::{build_label, classify_kind};
 use crate::suppress::SharedSuppressState;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+const PAYLOAD_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 // Password managers such as KeePassXC offer this marker alongside secret data.
 // Never request or store any representation of a marked selection.
 const PASSWORD_MANAGER_HINT_MIME: &str = "x-kde-passwordManagerHint";
@@ -273,6 +278,116 @@ fn payload_hash(payloads: &[(String, Vec<u8>)]) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PayloadReadError {
+    TooLarge { limit: usize },
+    TimedOut { idle_timeout: Duration },
+    Poll(Errno),
+}
+
+struct PayloadPipe {
+    mime: String,
+    file: std::fs::File,
+    data: Vec<u8>,
+    done: bool,
+}
+
+/// Drain every offered MIME pipe fairly.
+///
+/// Clipboard sources may keep earlier file descriptors open while writing a
+/// later MIME representation. Reading one pipe to EOF before touching the
+/// others can therefore deadlock both processes once a later pipe fills. Poll
+/// all pipes and read one chunk from each ready descriptor instead.
+fn read_payload_pipes(
+    pipes: Vec<(String, OwnedFd)>,
+    max_payload_bytes: usize,
+    idle_timeout: Duration,
+) -> std::result::Result<Vec<(String, Vec<u8>)>, PayloadReadError> {
+    let mut pipes: Vec<PayloadPipe> = pipes
+        .into_iter()
+        .map(|(mime, fd)| PayloadPipe {
+            mime,
+            file: std::fs::File::from(fd),
+            data: Vec::new(),
+            done: false,
+        })
+        .collect();
+    let mut total_size = 0usize;
+    let timeout_ms = idle_timeout.as_millis().clamp(1, u16::MAX as u128) as u16;
+
+    while pipes.iter().any(|pipe| !pipe.done) {
+        let active_indices: Vec<usize> = pipes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pipe)| (!pipe.done).then_some(index))
+            .collect();
+        let mut poll_fds: Vec<PollFd<'_>> = active_indices
+            .iter()
+            .map(|&index| {
+                PollFd::new(
+                    pipes[index].file.as_fd(),
+                    PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+                )
+            })
+            .collect();
+
+        let ready_count = loop {
+            match poll(&mut poll_fds, timeout_ms) {
+                Ok(count) => break count,
+                Err(Errno::EINTR) => continue,
+                Err(err) => return Err(PayloadReadError::Poll(err)),
+            }
+        };
+
+        if ready_count == 0 {
+            return Err(PayloadReadError::TimedOut { idle_timeout });
+        }
+
+        let ready: Vec<(usize, PollFlags)> = active_indices
+            .into_iter()
+            .zip(poll_fds.iter())
+            .filter_map(|(index, poll_fd)| {
+                let events = poll_fd.revents().unwrap_or_else(PollFlags::empty);
+                (!events.is_empty()).then_some((index, events))
+            })
+            .collect();
+        drop(poll_fds);
+
+        for (index, events) in ready {
+            let pipe = &mut pipes[index];
+
+            if events.contains(PollFlags::POLLNVAL) {
+                warn!("invalid clipboard pipe for {}", pipe.mime);
+                pipe.done = true;
+                continue;
+            }
+
+            let mut chunk = [0u8; READ_CHUNK_BYTES];
+            match pipe.file.read(&mut chunk) {
+                Ok(0) => pipe.done = true,
+                Ok(count) => {
+                    if count > max_payload_bytes.saturating_sub(total_size) {
+                        return Err(PayloadReadError::TooLarge {
+                            limit: max_payload_bytes,
+                        });
+                    }
+                    pipe.data.extend_from_slice(&chunk[..count]);
+                    total_size += count;
+                }
+                Err(err) => {
+                    warn!("read {}: {err}", pipe.mime);
+                    pipe.done = true;
+                }
+            }
+        }
+    }
+
+    Ok(pipes
+        .into_iter()
+        .filter_map(|pipe| (!pipe.data.is_empty()).then_some((pipe.mime, pipe.data)))
+        .collect())
+}
+
 /// Process a ready offer: issue receive() for each MIME type, flush, read, store.
 /// Must be called from the main loop (not from within dispatch) so we can flush.
 fn process_ready(
@@ -315,7 +430,8 @@ fn process_ready(
         return;
     }
 
-    // Close write ends so reads don't block forever.
+    // Drop our copies of the write ends after the descriptors have been sent;
+    // the clipboard source owns the remaining writers for each transfer.
     let pipes: Vec<(String, OwnedFd)> = pipes
         .into_iter()
         .map(|p| {
@@ -324,29 +440,24 @@ fn process_ready(
         })
         .collect();
 
-    let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut raw_total_size = 0usize;
-
-    for (mime, read_fd) in pipes {
-        let mut f = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
-        let mut buf = Vec::new();
-        match f.read_to_end(&mut buf) {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("read {mime}: {e}");
-                continue;
-            }
-        }
-        raw_total_size += buf.len();
-        if raw_total_size > MAX_PAYLOAD_BYTES {
-            warn!("entry exceeds 64 MiB cap, skipping");
+    let payloads = match read_payload_pipes(pipes, MAX_PAYLOAD_BYTES, PAYLOAD_READ_IDLE_TIMEOUT) {
+        Ok(payloads) => payloads,
+        Err(PayloadReadError::TooLarge { limit }) => {
+            warn!("entry exceeds {} MiB cap, skipping", limit / (1024 * 1024));
             offer.destroy();
             return;
         }
-        if !buf.is_empty() {
-            payloads.push((mime, buf));
+        Err(PayloadReadError::TimedOut { idle_timeout }) => {
+            warn!("clipboard transfer idle for {idle_timeout:?}, skipping");
+            offer.destroy();
+            return;
         }
-    }
+        Err(PayloadReadError::Poll(err)) => {
+            warn!("polling clipboard pipes: {err}");
+            offer.destroy();
+            return;
+        }
+    };
 
     offer.destroy();
 
@@ -438,7 +549,12 @@ pub fn run(db: Arc<Mutex<Database>>, suppress_hash: SharedSuppressState) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sensitive_offer, normalize_payloads, payload_hash};
+    use super::{
+        is_sensitive_offer, normalize_payloads, payload_hash, read_payload_pipes, PayloadReadError,
+    };
+    use nix::unistd::pipe;
+    use std::io::Write;
+    use std::time::Duration;
 
     #[test]
     fn duplicate_mime_names_hash_like_deduped_payloads() {
@@ -502,6 +618,86 @@ mod tests {
         assert_eq!(
             payload_hash(&normalized_first),
             payload_hash(&normalized_second)
+        );
+    }
+
+    #[test]
+    fn drains_large_mime_pipes_without_waiting_for_earlier_eof() {
+        let (first_read, first_write) = pipe().expect("first pipe");
+        let (second_read, second_write) = pipe().expect("second pipe");
+        let first_data = vec![0x41; 2 * 1024 * 1024];
+        let second_data = vec![0x42; 2 * 1024 * 1024];
+        let expected_first = first_data.clone();
+        let expected_second = second_data.clone();
+
+        // Keep the first descriptor open while filling the second. A reader
+        // that waits for EOF on the first pipe before draining the second will
+        // deadlock as soon as the second pipe reaches capacity.
+        let writer = std::thread::spawn(move || {
+            let mut first = std::fs::File::from(first_write);
+            let mut second = std::fs::File::from(second_write);
+            first.write_all(&first_data).expect("write first payload");
+            second
+                .write_all(&second_data)
+                .expect("write second payload");
+            drop(second);
+            drop(first);
+        });
+
+        let payloads = read_payload_pipes(
+            vec![
+                ("text/plain".to_string(), first_read),
+                ("text/html".to_string(), second_read),
+            ],
+            8 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .expect("drain both pipes");
+
+        writer.join().expect("writer thread");
+        assert_eq!(
+            payloads,
+            vec![
+                ("text/plain".to_string(), expected_first),
+                ("text/html".to_string(), expected_second),
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_total_payload_limit_while_reading() {
+        let (read_fd, write_fd) = pipe().expect("pipe");
+        let writer = std::thread::spawn(move || {
+            let mut writer = std::fs::File::from(write_fd);
+            let _ = writer.write_all(&vec![0x5a; 256 * 1024]);
+        });
+
+        let result = read_payload_pipes(
+            vec![("text/plain".to_string(), read_fd)],
+            64 * 1024,
+            Duration::from_secs(1),
+        );
+
+        writer.join().expect("writer thread");
+        assert_eq!(result, Err(PayloadReadError::TooLarge { limit: 64 * 1024 }));
+    }
+
+    #[test]
+    fn times_out_when_a_clipboard_source_never_sends_or_closes() {
+        let (read_fd, write_fd) = pipe().expect("pipe");
+
+        let result = read_payload_pipes(
+            vec![("text/plain".to_string(), read_fd)],
+            64 * 1024,
+            Duration::from_millis(20),
+        );
+
+        drop(write_fd);
+        assert_eq!(
+            result,
+            Err(PayloadReadError::TimedOut {
+                idle_timeout: Duration::from_millis(20),
+            })
         );
     }
 }
