@@ -25,8 +25,10 @@ pub struct NewEntry<'a> {
 
 impl Database {
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        restrict_database_permissions(path)?;
         let conn = Connection::open(path)
             .with_context(|| format!("opening database at {}", path.display()))?;
+        restrict_database_permissions(path)?;
         let max_entries = std::env::var("MIMECLIP_MAX_ENTRIES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -37,6 +39,7 @@ impl Database {
             has_legacy_timestamp: false,
         };
         db.init()?;
+        restrict_database_permissions(path)?;
         db.has_legacy_timestamp = db.entries_column_exists("timestamp")?;
         Ok(db)
     }
@@ -362,6 +365,29 @@ impl Database {
     }
 }
 
+#[cfg(unix)]
+fn restrict_database_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for path in [
+        path.to_path_buf(),
+        std::path::PathBuf::from(format!("{}-wal", path.display())),
+        std::path::PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        if path.exists() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_context(
+                || format!("restricting database file permissions {}", path.display()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_database_permissions(_: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 fn parse_kind(s: &str) -> EntryKind {
     match s {
         "text" => EntryKind::Text,
@@ -601,6 +627,25 @@ mod tests {
         std::fs::remove_file(&db_path).ok();
         std::fs::remove_file(db_path.with_extension("sqlite3-wal")).ok();
         std::fs::remove_file(db_path.with_extension("sqlite3-shm")).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_database_restricts_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db_path = unique_test_db_path("permissions");
+        let _db = Database::open(&db_path).expect("open test database");
+        let mode = std::fs::metadata(&db_path)
+            .expect("read database metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        std::fs::remove_file(&db_path).ok();
+        std::fs::remove_file(format!("{}-wal", db_path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", db_path.display())).ok();
     }
 
     fn unique_test_db_path(label: &str) -> PathBuf {

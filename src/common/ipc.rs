@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::types::{Entry, MimePayload};
@@ -29,7 +30,7 @@ pub fn socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(runtime).join("mimeclipd.sock")
 }
 
-pub fn db_path() -> std::path::PathBuf {
+pub fn db_path() -> Result<std::path::PathBuf> {
     let data = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -37,6 +38,25 @@ pub fn db_path() -> std::path::PathBuf {
             std::path::PathBuf::from(home).join(".local/share")
         });
     let dir = data.join("mimeclip");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join("history.db")
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating database directory {}", dir.display()))?;
+    restrict_directory_permissions(&dir)?;
+    Ok(dir.join("history.db"))
+}
+
+#[cfg(unix)]
+fn restrict_directory_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(|| {
+        format!(
+            "restricting database directory permissions {}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_directory_permissions(_: &std::path::Path) -> Result<()> {
+    Ok(())
 }

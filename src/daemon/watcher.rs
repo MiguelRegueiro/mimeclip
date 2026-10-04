@@ -29,6 +29,9 @@ use mimeclip_common::common::types::{build_label, classify_kind};
 use crate::suppress::SharedSuppressState;
 
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+// Password managers such as KeePassXC offer this marker alongside secret data.
+// Never request or store any representation of a marked selection.
+const PASSWORD_MANAGER_HINT_MIME: &str = "x-kde-passwordManagerHint";
 
 /// MIME types we skip (portal file-transfer sessions, etc.)
 const SKIP_MIME_PREFIXES: &[&str] = &[
@@ -163,10 +166,20 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WatchState {
                 state.pending_offers.clear();
 
                 if let (Some(offer), Some(mime_types)) = (id, selected_mimes) {
-                    if mime_types.is_empty() {
+                    if is_sensitive_offer(&mime_types) {
+                        info!("skipped sensitive clipboard selection");
                         offer.destroy();
                     } else {
-                        state.ready = Some(PendingOffer { offer, mime_types });
+                        let mime_types: Vec<String> = mime_types
+                            .into_iter()
+                            .filter(|mime| !should_skip(mime))
+                            .collect();
+
+                        if mime_types.is_empty() {
+                            offer.destroy();
+                        } else {
+                            state.ready = Some(PendingOffer { offer, mime_types });
+                        }
                     }
                 }
             }
@@ -190,7 +203,7 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for WatchState {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
             let oid = offer.id().protocol_id();
             if let Some(list) = state.pending_offers.get_mut(&oid) {
-                if !should_skip(&mime_type) {
+                if !list.contains(&mime_type) {
                     list.push(mime_type);
                 }
             }
@@ -202,6 +215,12 @@ fn should_skip(mime: &str) -> bool {
     SKIP_MIME_PREFIXES
         .iter()
         .any(|prefix| mime.starts_with(prefix))
+}
+
+fn is_sensitive_offer(mime_types: &[String]) -> bool {
+    mime_types
+        .iter()
+        .any(|mime| mime.eq_ignore_ascii_case(PASSWORD_MANAGER_HINT_MIME))
 }
 
 fn normalize_payloads(payloads: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
@@ -419,7 +438,7 @@ pub fn run(db: Arc<Mutex<Database>>, suppress_hash: SharedSuppressState) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_payloads, payload_hash};
+    use super::{is_sensitive_offer, normalize_payloads, payload_hash};
 
     #[test]
     fn duplicate_mime_names_hash_like_deduped_payloads() {
@@ -451,6 +470,15 @@ mod tests {
             payload_hash(&normalized_duplicated),
             payload_hash(&normalized_deduped)
         );
+    }
+
+    #[test]
+    fn password_manager_hint_marks_the_entire_offer_sensitive() {
+        let mime_types = vec![
+            "text/plain;charset=utf-8".to_string(),
+            "x-kde-passwordManagerHint".to_string(),
+        ];
+        assert!(is_sensitive_offer(&mime_types));
     }
 
     #[test]

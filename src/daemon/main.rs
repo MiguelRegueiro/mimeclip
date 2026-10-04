@@ -60,7 +60,7 @@ fn main() -> Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let db_path = db_path();
+    let db_path = db_path()?;
     info!("database: {}", db_path.display());
 
     let db = Arc::new(Mutex::new(Database::open(&db_path)?));

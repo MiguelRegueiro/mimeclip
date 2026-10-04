@@ -166,10 +166,12 @@ No config file. Behavior is controlled by environment variables:
 
 ## Privacy and security
 
-mimeclip records everything that passes through the clipboard: passwords, authentication tokens, private messages, file contents, screenshots, and anything else you copy. Be aware of the following:
+mimeclip records clipboard history locally. Be aware of the following:
 
-- **Storage is unencrypted.** The SQLite database at `~/.local/share/mimeclip/history.db` is a plain file. Anyone with read access to your home directory can read your clipboard history.
-- **Password manager copies are captured.** Most password managers clear the clipboard after a short timeout, but mimeclip will have already stored the entry. Delete it manually with `mimeclip delete <id>` or pause the daemon before copying secrets.
+- **Owner-only local storage.** The database directory is set to `0700`; the SQLite database and its WAL/SHM sidecars are set to `0600` whenever the daemon starts. Other local user accounts cannot read history through normal filesystem access.
+- **Storage is not encrypted.** The SQLite database at `~/.local/share/mimeclip/history.db` remains plaintext to your own account and to any process that can act as it. Use full-disk encryption to protect a powered-off machine or its backups.
+- **Password-manager hints are honored.** A clipboard selection offering the KDE-standard `x-kde-passwordManagerHint` MIME type is treated as sensitive and discarded before mimeclip requests or stores any payload. KeePassXC and other password managers commonly use this hint.
+- **Unmarked secrets are still captured.** No clipboard manager can safely infer that arbitrary text is a password. If an application does not mark its clipboard data sensitive, pause mimeclip before copying the secret or clear/delete it afterward.
 - **History is persistent across reboots.** Entries remain until explicitly deleted or until the `MIMECLIP_MAX_ENTRIES` limit is reached and they are pushed out.
 
 To delete a specific entry:
