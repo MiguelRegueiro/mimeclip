@@ -79,8 +79,23 @@ pub fn config_path() -> Result<PathBuf> {
 }
 
 pub fn save(config: &Config) -> Result<()> {
+    save_to_path(config, &config_path()?)
+}
+
+fn save_to_path(config: &Config, path: &std::path::Path) -> Result<()> {
     config.limits()?;
-    let path = config_path()?;
+    // Stow commonly makes this a symlink into a dotfiles repository. Resolve
+    // it before the atomic rename below so changing a setting updates the
+    // managed source rather than replacing the symlink in ~/.config.
+    let path = if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("resolving configuration symlink {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
     let parent = path.parent().expect("configuration path has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating configuration directory {}", parent.display()))?;
@@ -164,7 +179,8 @@ fn restrict_file_permissions(_: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_size, parse_size, DEFAULT_MAX_HISTORY_SIZE};
+    use super::{format_size, parse_size, save_to_path, Config, DEFAULT_MAX_HISTORY_SIZE};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_human_history_sizes() {
@@ -177,5 +193,45 @@ mod tests {
     #[test]
     fn formats_exact_binary_sizes() {
         assert_eq!(format_size(DEFAULT_MAX_HISTORY_SIZE), "256 MiB");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_preserves_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("mimeclip-config-test-{nanos}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("managed.toml");
+        let link = directory.join("config.toml");
+        std::fs::write(
+            &target,
+            "max_entries = 500\nmax_history_size = \"256 MiB\"\n",
+        )
+        .unwrap();
+        symlink(&target, &link).unwrap();
+
+        save_to_path(
+            &Config {
+                max_entries: 200,
+                max_history_size: "256 MiB".to_string(),
+            },
+            &link,
+        )
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("max_entries = 200"));
+
+        std::fs::remove_dir_all(directory).ok();
     }
 }
