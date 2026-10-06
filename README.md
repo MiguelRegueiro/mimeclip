@@ -31,6 +31,10 @@ Restoring the `file` entry offers all three MIME types (`x-special/gnome-copied-
 - Wayland compositor with `zwlr_data_control_manager_v1` support (Hyprland, Sway, and most wlroots-based compositors)
 - Rust toolchain to build
 
+MimeClip is designed for Unix-like systems, including Linux and FreeBSD. It
+does not require systemd. GNOME/Mutter is unsupported because it does not
+provide the wlroots data-control protocol MimeClip needs.
+
 ## Build
 
 ```bash
@@ -51,23 +55,28 @@ From a checkout, run one command:
 ./scripts/install.sh
 ```
 
-It installs both binaries with Cargo to `~/.cargo/bin`, installs/updates the
-current user's `mimeclipd` systemd service, starts it, and verifies it responds.
-It uses neither `sudo` nor a distribution package manager, so the same command
-works on Arch and Fedora. It requires a Rust toolchain and a systemd user
-session.
+It installs both binaries with Cargo to `~/.cargo/bin`. It uses neither `sudo`,
+a distribution package manager, nor an init system.
 
-## Running as a systemd user service
+## Starting the daemon
 
-`scripts/install.sh` handles this automatically. The installed service is at
-`~/.config/systemd/user/mimeclipd.service` and runs
-`~/.cargo/bin/mimeclipd`.
+Start exactly one `mimeclipd` process from the compositor session that owns the
+Wayland clipboard. For example, add `mimeclipd` to that compositor's autostart
+configuration. The daemon detects an existing live instance and refuses to
+replace it.
 
-Check it started:
+Check it started after the compositor session is up:
 
 ```bash
 mimeclip ping   # → pong
 ```
+
+### Optional systemd user service
+
+Systemd is only an optional supervisor. If you prefer it on a systemd desktop,
+copy `systemd/mimeclipd.service` to
+`~/.config/systemd/user/mimeclipd.service`, then enable it with
+`systemctl --user enable --now mimeclipd.service`.
 
 ## CLI
 
@@ -217,12 +226,6 @@ Clearing checkpoints the WAL and vacuums the SQLite database, reclaiming space
 from deleted image and blob payloads. This runs only for an explicit full clear,
 not during ordinary clipboard operations. It is not a secure erase: storage
 media, filesystem snapshots, or SSD wear-leveling may retain old bytes.
-
-To stop recording temporarily:
-
-```bash
-systemctl --user stop mimeclipd
-```
 
 ## Limitations
 

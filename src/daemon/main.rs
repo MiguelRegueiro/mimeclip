@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use wayland_client::{backend::WaylandError, ConnectError, DispatchError};
 
 use mimeclip_common::common::db::Database;
-use mimeclip_common::common::ipc::{db_path, socket_path};
+use mimeclip_common::common::ipc::db_path;
 use suppress::SuppressState;
 
 #[derive(Parser)]
@@ -68,14 +68,18 @@ fn main() -> Result<()> {
     // Shared hash used to suppress re-storing entries that we just restored.
     let suppress_hash = Arc::new(Mutex::new(SuppressState::default()));
 
-    // Clean up socket on SIGTERM or SIGINT.
-    let sock = socket_path();
+    // Bind before starting the watcher. A second daemon must fail as a whole,
+    // never keep watching the clipboard without owning the IPC endpoint.
+    let listener = server::bind()?;
+
+    // Do not unlink the IPC path on exit: a newer daemon may have safely
+    // rebound it after this process lost ownership. Startup removes only a
+    // verified stale socket.
     std::thread::spawn(move || {
         use signal_hook::consts::{SIGINT, SIGTERM};
         use signal_hook::iterator::Signals;
         let mut signals = Signals::new([SIGTERM, SIGINT]).expect("signal handler");
         if signals.forever().next().is_some() {
-            std::fs::remove_file(&sock).ok();
             std::process::exit(0);
         }
     });
@@ -84,7 +88,7 @@ fn main() -> Result<()> {
     let db_ipc = Arc::clone(&db);
     let suppress_ipc = Arc::clone(&suppress_hash);
     std::thread::spawn(move || {
-        if let Err(e) = server::run(db_ipc, suppress_ipc) {
+        if let Err(e) = server::run(listener, db_ipc, suppress_ipc) {
             log::error!("IPC server error: {e}");
         }
     });

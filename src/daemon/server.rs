@@ -1,5 +1,8 @@
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::{
+    fs::FileTypeExt,
+    net::{UnixListener, UnixStream},
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -13,6 +16,37 @@ use crate::restore;
 use crate::suppress::SharedSuppressState;
 
 const MAX_SCREENSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn bind_listener(path: &Path) -> Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == ErrorKind::AddrInUse => {
+            let metadata = std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspecting existing IPC socket {}", path.display()))?;
+            if !metadata.file_type().is_socket() {
+                bail!("IPC path exists but is not a socket: {}", path.display());
+            }
+
+            match UnixStream::connect(path) {
+                Ok(_) => bail!("mimeclipd is already running"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path)
+                        .with_context(|| format!("removing stale IPC socket {}", path.display()))?;
+                    UnixListener::bind(path)
+                        .with_context(|| format!("binding IPC socket {}", path.display()))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("checking existing IPC socket {}", path.display())),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("binding IPC socket {}", path.display())),
+    }
+}
 
 fn screenshot_payloads(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let path = std::fs::canonicalize(path)
@@ -69,15 +103,17 @@ fn file_uri_path(path: &str) -> String {
     encoded
 }
 
-pub fn run(db: Arc<Mutex<Database>>, suppress_hash: SharedSuppressState) -> Result<()> {
+pub fn bind() -> Result<UnixListener> {
     let path = socket_path();
+    bind_listener(&path)
+}
 
-    // Remove stale socket.
-    if path.exists() {
-        std::fs::remove_file(&path).ok();
-    }
-
-    let listener = UnixListener::bind(&path)?;
+pub fn run(
+    listener: UnixListener,
+    db: Arc<Mutex<Database>>,
+    suppress_hash: SharedSuppressState,
+) -> Result<()> {
+    let path = socket_path();
     info!("IPC socket: {}", path.display());
 
     for stream in listener.incoming() {
@@ -241,7 +277,22 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::file_uri_path;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{bind_listener, file_uri_path};
+
+    fn test_socket_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "mimeclip-server-test-{}-{nonce}.sock",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn file_uri_path_escapes_reserved_characters() {
@@ -249,5 +300,28 @@ mod tests {
             file_uri_path("/tmp/a screenshot#1.png"),
             "/tmp/a%20screenshot%231.png"
         );
+    }
+
+    #[test]
+    fn refuses_to_replace_a_live_socket() {
+        let path = test_socket_path();
+        let live_listener = UnixListener::bind(&path).expect("bind live socket");
+
+        let error = bind_listener(&path).expect_err("must not replace live socket");
+        assert!(error.to_string().contains("already running"));
+
+        drop(live_listener);
+        std::fs::remove_file(path).expect("remove test socket");
+    }
+
+    #[test]
+    fn replaces_a_stale_socket() {
+        let path = test_socket_path();
+        let stale_listener = UnixListener::bind(&path).expect("bind stale socket");
+        drop(stale_listener);
+
+        let listener = bind_listener(&path).expect("replace stale socket");
+        drop(listener);
+        std::fs::remove_file(path).expect("remove test socket");
     }
 }
